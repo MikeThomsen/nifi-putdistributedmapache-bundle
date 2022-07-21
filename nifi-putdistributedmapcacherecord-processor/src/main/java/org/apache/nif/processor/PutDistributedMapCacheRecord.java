@@ -17,9 +17,11 @@
 package org.apache.nif.processor;
 
 import org.apache.nifi.annotation.behavior.InputRequirement;
+import org.apache.nifi.annotation.lifecycle.OnScheduled;
 import org.apache.nifi.components.AllowableValue;
 import org.apache.nifi.components.PropertyDescriptor;
 import org.apache.nifi.components.Validator;
+import org.apache.nifi.controller.ConfigurationContext;
 import org.apache.nifi.distributed.cache.client.Deserializer;
 import org.apache.nifi.distributed.cache.client.DistributedMapCacheClient;
 import org.apache.nifi.distributed.cache.client.Serializer;
@@ -33,6 +35,9 @@ import org.apache.nifi.processor.ProcessSession;
 import org.apache.nifi.processor.Relationship;
 import org.apache.nifi.processor.exception.ProcessException;
 import org.apache.nifi.processor.util.StandardValidators;
+import org.apache.nifi.record.path.RecordPath;
+import org.apache.nifi.record.path.util.RecordPathCache;
+import org.apache.nifi.serialization.RecordReaderFactory;
 
 import java.io.IOException;
 import java.io.OutputStream;
@@ -53,10 +58,26 @@ public class PutDistributedMapCacheRecord extends AbstractProcessor {
             .identifiesControllerService(DistributedMapCacheClient.class)
             .build();
 
-    public static final PropertyDescriptor CACHE_ENTRY_IDENTIFIER = new PropertyDescriptor.Builder()
-            .name("Cache Entry Identifier")
-            .description("A FlowFile attribute, or the results of an Attribute Expression Language statement, which will " +
-                    "be evaluated against a FlowFile in order to determine the cache key")
+    public static final PropertyDescriptor RECORD_READER = new PropertyDescriptor.Builder()
+            .name("putdistributedmapcacherecord-record-reader")
+            .displayName("Record Reader")
+            .description("The record reader service for reading the input flowfiles")
+            .required(true)
+            .addValidator(Validator.VALID)
+            .identifiesControllerService(RecordReaderFactory.class)
+            .build();
+
+    public static final PropertyDescriptor CACHE_ENTRY_IDENTIFIER_RP = new PropertyDescriptor.Builder()
+            .name("Cache Entry Identifier Record Path")
+            .description("A record path operation that finds or builds the cache entry's key")
+            .required(true)
+            .addValidator(StandardValidators.NON_EMPTY_EL_VALIDATOR)
+            .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
+            .build();
+
+    public static final PropertyDescriptor CACHE_ENTRY_VALUE_RP = new PropertyDescriptor.Builder()
+            .name("Cache Entry Value Record Path")
+            .description("A record path operation that finds or builds the cache entry's value")
             .required(true)
             .addValidator(StandardValidators.NON_EMPTY_EL_VALIDATOR)
             .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
@@ -94,24 +115,19 @@ public class PutDistributedMapCacheRecord extends AbstractProcessor {
             .name("failure")
             .description("Any FlowFile that cannot be inserted into the cache will be routed to this relationship")
             .build();
-    private final Set<Relationship> relationships;
+    private Set<Relationship> relationships;
 
     private final Serializer<String> keySerializer = new StringSerializer();
     private final Serializer<byte[]> valueSerializer = new CacheValueSerializer();
     private final Deserializer<byte[]> valueDeserializer = new CacheValueDeserializer();
 
-    public PutDistributedMapCacheRecord() {
-        final Set<Relationship> rels = new HashSet<>();
-        rels.add(REL_SUCCESS);
-        rels.add(REL_FAILURE);
-        relationships = Collections.unmodifiableSet(rels);
-    }
-
     @Override
     protected List<PropertyDescriptor> getSupportedPropertyDescriptors() {
         final List<PropertyDescriptor> descriptors = new ArrayList<>();
-        descriptors.add(CACHE_ENTRY_IDENTIFIER);
+        descriptors.add(RECORD_READER);
         descriptors.add(DISTRIBUTED_MAP_CACHE_CLIENT);
+        descriptors.add(CACHE_ENTRY_IDENTIFIER_RP);
+        descriptors.add(CACHE_ENTRY_VALUE_RP);
         descriptors.add(CACHE_UPDATE_STRATEGY);
         descriptors.add(CACHE_ENTRY_MAX_BYTES);
         return descriptors;
@@ -119,7 +135,26 @@ public class PutDistributedMapCacheRecord extends AbstractProcessor {
 
     @Override
     public Set<Relationship> getRelationships() {
+        final Set<Relationship> rels = new HashSet<>();
+        rels.add(REL_SUCCESS);
+        rels.add(REL_FAILURE);
+        relationships = Collections.unmodifiableSet(rels);
         return relationships;
+    }
+
+    private DistributedMapCacheClient distributedMapCacheClient;
+    private RecordReaderFactory recordReaderFactory;
+    private String cacheUpdateStrategy;
+    private long maxBytes;
+    private RecordPathCache recordPathCache;
+
+    @OnScheduled
+    public void onScheduled(ProcessContext context) {
+        recordPathCache = new RecordPathCache(16);
+        distributedMapCacheClient = context.getProperty(DISTRIBUTED_MAP_CACHE_CLIENT).asControllerService(DistributedMapCacheClient.class);
+        recordReaderFactory = context.getProperty(RECORD_READER).asControllerService(RecordReaderFactory.class);
+        cacheUpdateStrategy = context.getProperty(CACHE_UPDATE_STRATEGY).getValue();
+        maxBytes = context.getProperty(CACHE_ENTRY_MAX_BYTES).asLong();
     }
 
     @Override
@@ -128,6 +163,18 @@ public class PutDistributedMapCacheRecord extends AbstractProcessor {
         if (input == null) {
             return;
         }
+
+        final String keyPath = context.getProperty(CACHE_ENTRY_IDENTIFIER_RP)
+                .evaluateAttributeExpressions(input).getValue();
+        final String valuePath = context.getProperty(CACHE_ENTRY_VALUE_RP)
+                .evaluateAttributeExpressions(input).getValue();
+        if (getLogger().isDebugEnabled()) {
+            getLogger().debug(String.format("keyPath => %s", keyPath));
+            getLogger().debug(String.format("valuePath => %s", valuePath));
+        }
+
+        RecordPath keyRecordPath = recordPathCache.getCompiled(keyPath);
+        RecordPath valueRecordPath =  recordPathCache.getCompiled(valuePath);
     }
 
     public static class CacheValueSerializer implements Serializer<byte[]> {
