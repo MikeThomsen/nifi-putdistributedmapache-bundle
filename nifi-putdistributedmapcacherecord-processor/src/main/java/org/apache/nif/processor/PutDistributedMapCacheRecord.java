@@ -21,7 +21,6 @@ import org.apache.nifi.annotation.lifecycle.OnScheduled;
 import org.apache.nifi.components.AllowableValue;
 import org.apache.nifi.components.PropertyDescriptor;
 import org.apache.nifi.components.Validator;
-import org.apache.nifi.controller.ConfigurationContext;
 import org.apache.nifi.distributed.cache.client.Deserializer;
 import org.apache.nifi.distributed.cache.client.DistributedMapCacheClient;
 import org.apache.nifi.distributed.cache.client.Serializer;
@@ -30,22 +29,28 @@ import org.apache.nifi.distributed.cache.client.exception.SerializationException
 import org.apache.nifi.expression.ExpressionLanguageScope;
 import org.apache.nifi.flowfile.FlowFile;
 import org.apache.nifi.processor.AbstractProcessor;
+import org.apache.nifi.processor.DataUnit;
 import org.apache.nifi.processor.ProcessContext;
 import org.apache.nifi.processor.ProcessSession;
 import org.apache.nifi.processor.Relationship;
 import org.apache.nifi.processor.exception.ProcessException;
 import org.apache.nifi.processor.util.StandardValidators;
+import org.apache.nifi.record.path.FieldValue;
 import org.apache.nifi.record.path.RecordPath;
 import org.apache.nifi.record.path.util.RecordPathCache;
+import org.apache.nifi.serialization.RecordReader;
 import org.apache.nifi.serialization.RecordReaderFactory;
+import org.apache.nifi.serialization.record.Record;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 
 @InputRequirement(InputRequirement.Requirement.INPUT_REQUIRED)
@@ -154,7 +159,7 @@ public class PutDistributedMapCacheRecord extends AbstractProcessor {
         distributedMapCacheClient = context.getProperty(DISTRIBUTED_MAP_CACHE_CLIENT).asControllerService(DistributedMapCacheClient.class);
         recordReaderFactory = context.getProperty(RECORD_READER).asControllerService(RecordReaderFactory.class);
         cacheUpdateStrategy = context.getProperty(CACHE_UPDATE_STRATEGY).getValue();
-        maxBytes = context.getProperty(CACHE_ENTRY_MAX_BYTES).asLong();
+        maxBytes = context.getProperty(CACHE_ENTRY_MAX_BYTES).asDataSize(DataUnit.B).longValue();
     }
 
     @Override
@@ -175,6 +180,42 @@ public class PutDistributedMapCacheRecord extends AbstractProcessor {
 
         RecordPath keyRecordPath = recordPathCache.getCompiled(keyPath);
         RecordPath valueRecordPath =  recordPathCache.getCompiled(valuePath);
+
+        boolean error = false;
+        try (InputStream is = session.read(input);
+             RecordReader recordReader = recordReaderFactory.createRecordReader(input, is, getLogger())) {
+            Record record = recordReader.nextRecord();
+            while (record != null) {
+                Optional<FieldValue> keyResult = keyRecordPath.evaluate(record).getSelectedFields().findFirst();
+                Optional<FieldValue> valueResult = valueRecordPath.evaluate(record).getSelectedFields().findFirst();
+
+                if (keyResult.isPresent() && valueResult.isPresent()) {
+                    String key = keyResult.get().getValue().toString();
+                    String value = valueResult.get().getValue().toString();
+                    writeEntry(key, value);
+                }
+
+                record = recordReader.nextRecord();
+            }
+        } catch (Exception e) {
+            getLogger().error("", e);
+            error = true;
+        } finally {
+            if (!error) {
+                session.transfer(input, REL_SUCCESS);
+            } else {
+                session.transfer(input, REL_FAILURE);
+            }
+        }
+    }
+
+    private void writeEntry(String key, String value) throws IOException {
+        byte[] valueBytes = value.getBytes();
+        if (cacheUpdateStrategy.equals(CACHE_UPDATE_REPLACE.getValue())) {
+            distributedMapCacheClient.put(key, valueBytes, keySerializer, valueSerializer);
+        } else if (cacheUpdateStrategy.equals(CACHE_UPDATE_KEEP_ORIGINAL.getValue())) {
+            distributedMapCacheClient.getAndPutIfAbsent(key, valueBytes, keySerializer, valueSerializer, valueDeserializer);
+        }
     }
 
     public static class CacheValueSerializer implements Serializer<byte[]> {
